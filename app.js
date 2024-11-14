@@ -1,7 +1,11 @@
 const AWS = require('aws-sdk');
 const axios = require('axios');
+const fs = require('fs');
 
-const s3 = new AWS.S3();
+let s3 = null;
+
+let CREATE_FILE = false;
+const FILE_NAME = 'apigw-topo.data';
 
 // Configuration
 const BUCKET_NAME = process.env.AWS_BUCKET_NAME;
@@ -32,6 +36,9 @@ const ENV_TO_VHOST_REL_YTPE = 'contains';
 const ENV_TO_PROX_REL_TYPE = 'uses';
 const PROXY_TO_TSERVER_REL_TYPE = 'runsOn';
 
+// will be set during runtime based on env var
+let USE_PROXY = false;
+let PROXY_URL = '';
 let AIOPS_AUTH_TOKEN = '';
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -48,17 +55,29 @@ async function getAuthToken() {
             {
                 headers: {
                     'Content-Type': 'application/json',
-                }
+                },
+                proxy: false
             }
         );
+
+        // Extract the token from the response data
         const token = response.data.token;
+
+        // Return the token
         return token;
     } catch (error) {
-        console.error('Error getting AIOps authentication token:', error.response ? error.response.data : error.message);
+        console.error('Error:', error.response ? error.response.data : error.message);
+        return null;
     }
+}
+
+// helper funciton to convert a string to boolean
+async function envStringToBoolean(envVar) {
+    return envVar === 'true' || envVar === '1';
 }
 // function to fetch the OPCO topology elements
 async function fetchTopologyData() {
+    console.log('Fetching topology data for all opcos...');
     const url = `${AIOPS_TOPO_EP}?_field=uniqueId&_field=name&_type=${OPCO_ENT_TYPE}&_include_global_resources=false&_include_count=false&_include_status=false&_include_status_severity=false&_include_metadata=false&_return_composites=false`;
 
     try {
@@ -67,7 +86,8 @@ async function fetchTopologyData() {
                 'accept': 'application/json',
                 'X-TenantID': 'cfd95b7e-3bc7-4006-a4a8-a73a79c71255',
                 'Authorization': 'Bearer ' + AIOPS_AUTH_TOKEN
-            }
+            },
+            proxy: false
         });
 
         if (response.data) {
@@ -75,6 +95,7 @@ async function fetchTopologyData() {
             response.data._items.forEach(item => {
                 opcoToUniqueIdMapping[item.name] = item.uniqueId;
             });
+            console.log('Done fetching topology data for all opcos.');
             return opcoToUniqueIdMapping;
         }
         else {
@@ -137,24 +158,56 @@ async function epochToHumanReadable(epochSeconds) {
     return readable;
 }
 
-// helper function to post data to AIOps
-async function sendToTopoApi(endpoint, data) {
-    const headers = {
-        'accept': 'application/json',
-        'X-TenantID': 'cfd95b7e-3bc7-4006-a4a8-a73a79c71255',
-        'JobId': AIOPS_OBS_JOBNAME,
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + AIOPS_AUTH_TOKEN
-    };
+// helper function to post data to AIOps or write to file
+async function sendToTopoApiOrFile(endpoint, data) {
+    if (CREATE_FILE === true) {
+        // based on the endpoint we decide it the resulting element
+        // will be a Vertex(V) or Edge (E)
+        let jsonString = JSON.stringify(data);
+        if (endpoint === AIOPS_RESOURCES_EP) {
+            jsonString = `V:${jsonString}\n`;
+            try {
+                fs.appendFileSync(FILE_NAME, jsonString);
+                return true;
+            } catch (err) {
+                console.error('Error appending to file:', err);
+                return false;
+            }            
+        }
+        else if (endpoint === AIOPS_REFERENCES_EP) {
+            jsonString = `E:${jsonString}\n`;
+            try {
+                fs.appendFileSync(FILE_NAME, jsonString);
+                return true;
+            } catch (err) {
+                console.error('Error appending to file:', err);
+                return false;
+            }   
+        }
+        else {
+            console.error('Encountered an unexpexted target endpoint to chosse between vertex of edge!');
+            return false;
+        }
 
-    try {
-        const response = await axios.post(endpoint, data, { headers });
-        console.log(`Successfully sent data to topology API!`, response.status);
-        return true;
-    } catch (error) {
-        console.log(error);
-        console.error(`Error sending data to topology API!`, error.response ? error.response.data : error.message);
-        return false;
+    }
+    else {
+        const headers = {
+            'accept': 'application/json',
+            'X-TenantID': 'cfd95b7e-3bc7-4006-a4a8-a73a79c71255',
+            'JobId': AIOPS_OBS_JOBNAME,
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + AIOPS_AUTH_TOKEN
+        };
+
+        try {
+            const response = await axios.post(endpoint, data, { headers, proxy: false });
+            console.log(`Successfully sent data to topology API!`, response.status);
+            return true;
+        } catch (error) {
+            console.log(error);
+            console.error(`Error sending data to topology API!`, error.response ? error.response.data : error.message);
+            return false;
+        }
     }
 }
 
@@ -216,6 +269,7 @@ async function processDeploymentData(deploymentFile) {
 
 // function to process the environment for a country
 async function processCountry(deployment, environments) {
+    console.log('Processing deployment data for deployment: ', deployment);
     const deploymentFile = `${deployment}/${deployment}.json`;  // Assuming the deployment file is always named after the deployment
     const deploymentDetails = await processDeploymentData(deploymentFile);
 
@@ -260,10 +314,12 @@ async function processCountry(deployment, environments) {
         }
         deploymentData.environments.push(environmentObject);
     }
+    console.log('Done processing deployment data for deployment: ', deployment);
     return deploymentData;
 }
 
 async function processAllDeployments() {
+    console.log('Processing deployments and environemnts as per configuration...');
     const results = [];
     const apigwDeploymentsList = APIGW_DEPLOYMENTS ? APIGW_DEPLOYMENTS.split(',') : [];
     const apigwDeployments = apigwDeploymentsList.map(item => item.trim());
@@ -275,11 +331,13 @@ async function processAllDeployments() {
         const countryData = await processCountry(country, apigwDeploymentsEnvs);
         results.push(countryData);
     }
+    console.log('Done processing deployments and environemnts as per configuration.');
     return results;
 }
 
 // function to transform the JSON data to a format that AIOps can use
 async function transformDataAndSendToApi(data) {
+    console.log('Transforming S3 data for AIOps...');
     if (data && data.length > 0) {
         console.log(`Extracted ${data.length} OPCO item(s)...`);
 
@@ -318,7 +376,7 @@ async function transformDataAndSendToApi(data) {
                     if (deploymentTopoElement.lastModifiedAt) {
                         deploymentTopoElement.lastModifiedAt = await epochToHumanReadable(deploymentTopoElement.lastModifiedAt);
                     }
-                    if (await sendToTopoApi(AIOPS_RESOURCES_EP, deploymentTopoElement)) {
+                    if (await sendToTopoApiOrFile(AIOPS_RESOURCES_EP, deploymentTopoElement)) {
                         console.log(`Successfully sent data for deployment ${deploymentName} in OPCO ${opcoName}`);
                     }
                     else {
@@ -331,7 +389,7 @@ async function transformDataAndSendToApi(data) {
                         _toUniqueId: deploymentUniqueName,
                         _edgeType: OPCO_TO_DEPL_REL_TYPE
                     }
-                    if (await sendToTopoApi(AIOPS_REFERENCES_EP, deploymentTopoElementRelation)) {
+                    if (await sendToTopoApiOrFile(AIOPS_REFERENCES_EP, deploymentTopoElementRelation)) {
                         console.log(`Successfully created relation from OPCO ${opcoName} to deployment ${deploymentName}`);
                     }
                     else {
@@ -366,7 +424,7 @@ async function transformDataAndSendToApi(data) {
                             delete environmentTopoElement.proxies;
                             delete environmentTopoElement['virtual-hosts'];
 
-                            if (await sendToTopoApi(AIOPS_RESOURCES_EP, environmentTopoElement)) {
+                            if (await sendToTopoApiOrFile(AIOPS_RESOURCES_EP, environmentTopoElement)) {
                                 console.log(`Successfully sent data for environment ${envName} of deployment ${deploymentName} in OPCO ${opcoName}`);
                             }
                             else {
@@ -379,7 +437,7 @@ async function transformDataAndSendToApi(data) {
                                 _toUniqueId: envUniqueId,
                                 _edgeType: DEPL_TO_ENV_REL_TYPE
                             }
-                            if (await sendToTopoApi(AIOPS_REFERENCES_EP, environmentTopoElementRelation)) {
+                            if (await sendToTopoApiOrFile(AIOPS_REFERENCES_EP, environmentTopoElementRelation)) {
                                 console.log(`Successfully created relation from deployment ${deploymentName} to environment ${envName}`);
                             }
                             else {
@@ -413,7 +471,7 @@ async function transformDataAndSendToApi(data) {
                                     }
                                     Object.assign(vHostTopoElement, virtualHost);
 
-                                    if (await sendToTopoApi(AIOPS_RESOURCES_EP, vHostTopoElement)) {
+                                    if (await sendToTopoApiOrFile(AIOPS_RESOURCES_EP, vHostTopoElement)) {
                                         console.log(`Successfully sent data for virtual host ${vHostName} of deployment ${deploymentName} in environment ${envName} in OPCO ${opcoName}`);
                                     }
                                     else {
@@ -427,7 +485,7 @@ async function transformDataAndSendToApi(data) {
                                         _edgeType: ENV_TO_VHOST_REL_YTPE
                                     }
 
-                                    if (await sendToTopoApi(AIOPS_REFERENCES_EP, vHostTopoElementRelation)) {
+                                    if (await sendToTopoApiOrFile(AIOPS_REFERENCES_EP, vHostTopoElementRelation)) {
                                         console.log(`Successfully created relation from environment ${envName} to virtual host ${vHostName}`);
                                     }
                                     else {
@@ -466,7 +524,7 @@ async function transformDataAndSendToApi(data) {
                                         proxyTopoElement.lastModifiedAt = await epochToHumanReadable(proxyTopoElement.lastModifiedAt);
                                     }
 
-                                    if (await sendToTopoApi(AIOPS_RESOURCES_EP, proxyTopoElement)) {
+                                    if (await sendToTopoApiOrFile(AIOPS_RESOURCES_EP, proxyTopoElement)) {
                                         console.log(`Successfully sent data for proxy ${proxyName} of deployment ${deploymentName} in environment ${envName} in OPCO ${opcoName}`);
                                     }
                                     else {
@@ -479,7 +537,7 @@ async function transformDataAndSendToApi(data) {
                                         _toUniqueId: proxyUniqueId,
                                         _edgeType: ENV_TO_PROX_REL_TYPE
                                     }
-                                    if (await sendToTopoApi(AIOPS_REFERENCES_EP, proxyTopoElementRelation)) {
+                                    if (await sendToTopoApiOrFile(AIOPS_REFERENCES_EP, proxyTopoElementRelation)) {
                                         console.log(`Successfully created relation from environment ${envName} to proxy ${proxyName}`);
                                     }
                                     else {
@@ -507,7 +565,7 @@ async function transformDataAndSendToApi(data) {
 
                                             Object.assign(targetServerTopoElement, targetServer);
 
-                                            if (await sendToTopoApi(AIOPS_RESOURCES_EP, targetServerTopoElement)) {
+                                            if (await sendToTopoApiOrFile(AIOPS_RESOURCES_EP, targetServerTopoElement)) {
                                                 console.log(`Successfully sent data for targetServer ${targetServerName} of deployment ${deploymentName} in environment ${envName} in OPCO ${opcoName}`);
                                             }
                                             else {
@@ -520,7 +578,7 @@ async function transformDataAndSendToApi(data) {
                                                 _toUniqueId: targetServerUniqueId,
                                                 _edgeType: PROXY_TO_TSERVER_REL_TYPE
                                             }
-                                            if (await sendToTopoApi(AIOPS_REFERENCES_EP, targetServerTopoElementRelation)) {
+                                            if (await sendToTopoApiOrFile(AIOPS_REFERENCES_EP, targetServerTopoElementRelation)) {
                                                 console.log(`Successfully created relation from proxy ${proxyName} to targetServer ${targetServerName}`);
                                             }
                                             else {
@@ -553,14 +611,61 @@ async function transformDataAndSendToApi(data) {
     else {
         console.error('No data found in S3 bucket. Please see previous log messages for error details.');
     }
+    console.log('Done transforming S3 data for AIOps.');
 }
 
 (async function main() {
     try {
-        const data = await processAllDeployments();
-        //console.log('Generated data array:', JSON.stringify(data, null, 2));
+        console.log("Trying to get Bearer token from AIOps Auth endpoint...");
         AIOPS_AUTH_TOKEN = await getAuthToken();
-        await transformDataAndSendToApi(data);
+        let retryCount = 0
+        while (retryCount < 3 && AIOPS_AUTH_TOKEN == null) {
+            console.warn("Warning: Could not get AIOps Auth token. Retrying...");
+            retryCount++;
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            AIOPS_AUTH_TOKEN = await getAuthToken();
+        }
+        if (AIOPS_AUTH_TOKEN == null) {
+            console.error("ERROR getting AIOps Auth token, retry limit reached! Cannot continue.");
+            process.exit(1);
+        }
+        else {
+            console.log("Bearer token from AIOps Auth endpoint received.");
+
+            CREATE_FILE = await envStringToBoolean(process.env.APP_CREATE_FILE);
+            if (CREATE_FILE === true) {
+                console.log('Will be creating an output file instead of sending data to AIOps API...');
+                // remove an old file if it exists
+                if (fs.existsSync(FILE_NAME)) {
+                    try {
+                        fs.unlinkSync(FILE_NAME);
+                        console.log(`Old file ${FILE_NAME} was deleted successfully.`);
+                    } catch (err) {
+                        console.error(`Error deleting file ${FILE_NAME}:`, err.message);
+                    }
+                }
+            }
+
+            USE_PROXY = await envStringToBoolean(process.env.APP_USE_PROXY);
+            if (USE_PROXY) {
+                PROXY_URL = process.env.APP_PROXY_URL;
+                const proxyAgent = await new ProxyAgent(PROXY_URL);
+                AWS.config.update({
+                    httpOptions: { agent: proxyAgent }
+                });
+                console.log(`Using proxy url <${PROXY_URL}> to access AWS S3 bucket...`);
+            }
+            else {
+                console.log("NOT using proxy to access AWS S3 bucket.");
+            }
+            s3 = new AWS.S3();
+
+            console.log('Looking for deployment data in bucket: ', BUCKET_NAME);
+            const data = await processAllDeployments();
+
+            await transformDataAndSendToApi(data);
+        }
+
     } catch (error) {
         console.error('Error processing S3 data:', error);
     }
